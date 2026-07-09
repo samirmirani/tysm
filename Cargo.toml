@@ -1,8 +1,11 @@
+# wfc maintenance fork of not-pizza/tysm, based on the published 0.18.0.
+# Fork changes (cache-layer safety fixes): see the "wfc maintenance fork"
+# section in README.md and the git history on the `wfc` branch.
 [package]
 name = "tysm"
-version = "0.18.0"
+version = "0.18.1"
 edition = "2021"
-description = "Batteries-included Rust OpenAI Client"
+description = "Batteries-included Rust OpenAI Client (wfc maintenance fork of not-pizza/tysm 0.18.0 with cache-layer safety fixes)"
 license = "MIT"
 homepage = "https://github.com/not-pizza/tysm"
 repository = "https://github.com/not-pizza/tysm"

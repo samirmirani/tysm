@@ -19,7 +19,11 @@ use crate::batch::{BatchResponseItem, BatchStatus};
 use crate::schema::OpenAiTransform;
 use crate::utils::{api_key, OpenAiApiKeyError};
 use crate::OpenAiError;
-use log::{debug, info};
+use log::{debug, info, warn};
+
+/// Default maximum number of responses retained in the in-memory `lru` cache
+/// of a [`ChatClient`]. See [`ChatClient::with_lru_capacity`].
+const DEFAULT_LRU_CAPACITY: usize = 4096;
 
 /// To use this library, you need to create a [`ChatClient`]. This contains various information needed to interact with the ChatGPT API,
 /// such as the API key, the model to use, and the URL of the API.
@@ -47,7 +51,16 @@ pub struct ChatClient {
     /// The model to use for the ChatGPT API.
     pub model: String,
     /// A cache of recent responses.
+    ///
+    /// This map is **bounded** by [`Self::lru_capacity`] (see [`Self::lru_insert`]).
+    /// It previously grew without limit, which leaked memory in long-lived
+    /// clients (e.g. process-lifetime `static` clients).
     pub lru: DashMap<String, String>,
+    /// Maximum number of entries retained in the in-memory [`Self::lru`] cache.
+    ///
+    /// Defaults to [`DEFAULT_LRU_CAPACITY`]. Configure with
+    /// [`Self::with_lru_capacity`].
+    pub lru_capacity: usize,
     /// This client's token consumption (as reported by the API). Batch requests will not affect `usage`.
     pub usage: RwLock<ChatUsage>,
     /// The directory in which to cache responses to requests
@@ -727,6 +740,7 @@ impl ChatClient {
             chat_completions_path: "chat/completions".to_string(),
             model: model.into(),
             lru: DashMap::new(),
+            lru_capacity: DEFAULT_LRU_CAPACITY,
             usage: RwLock::new(ChatUsage::default()),
             cache_directory: None,
             backup_cache_directory: None,
@@ -795,6 +809,42 @@ impl ChatClient {
             semaphore: Semaphore::new(max),
             ..self
         }
+    }
+
+    /// Set the maximum number of responses retained in the in-memory [`Self::lru`]
+    /// cache.
+    ///
+    /// Defaults to [`DEFAULT_LRU_CAPACITY`]. Once the cache reaches this many
+    /// entries it is cleared wholesale before the next insert (a generational
+    /// bound; see [`Self::lru_insert`]). A capacity of `0` disables the
+    /// in-memory cache entirely (nothing is retained). The persistent on-disk
+    /// cache, if configured, is unaffected.
+    pub fn with_lru_capacity(mut self, capacity: usize) -> Self {
+        self.lru_capacity = capacity;
+        self
+    }
+
+    /// Insert a response into the bounded in-memory [`Self::lru`] cache.
+    ///
+    /// [`DashMap`] has no native LRU ordering, and tracking true recency would
+    /// require a second synchronized structure plus locking on the hot path.
+    /// Instead we enforce a hard *capacity bound* with a generational reset:
+    /// once the map is at capacity we clear it wholesale before inserting.
+    /// This keeps memory bounded (the map previously grew without limit,
+    /// leaking ~12-15 KB per unique request in long-lived `static` clients) at
+    /// the cost of occasionally dropping still-warm entries. The persistent
+    /// on-disk cache (when configured) is unaffected and still serves those
+    /// requests. Under heavy concurrency the bound is approximate (the `len`
+    /// check and the `clear` are not atomic), which is fine for a memory ceiling.
+    fn lru_insert(&self, key: String, value: String) {
+        // A capacity of 0 disables the in-memory cache.
+        if self.lru_capacity == 0 {
+            return;
+        }
+        if self.lru.len() >= self.lru_capacity && !self.lru.contains_key(&key) {
+            self.lru.clear();
+        }
+        self.lru.insert(key, value);
     }
 
     /// If set, all uncached requests will fail with [`ChatError::CacheMiss`] instead of
@@ -1104,25 +1154,10 @@ impl ChatClient {
             let (result, usage) = process_result(chat_response.clone())?;
             *self.usage.write().unwrap() += usage;
 
-            // cache the response
-            {
-                let chat_request_cache_key = chat_request.cache_key();
-                let chat_request = serde_json::to_string(&chat_request)
-                    .map_err(|e| ChatError::JsonSerializeError(e, chat_request.clone()))?;
-
-                if let Some(cache_directory) = &self.cache_directory {
-                    // Compress the response with zstd before writing to disk
-                    let compressed = zstd::encode_all(chat_response.as_bytes(), 3)?;
-                    crate::utils::write_to_cache_dir(
-                        cache_directory,
-                        &chat_request_cache_key,
-                        &compressed,
-                    )
-                    .await?;
-                }
-
-                self.lru.insert(chat_request, chat_response.clone());
-            }
+            // Cache the response. Best-effort by contract: the API call above
+            // already succeeded (and was billed), so a cache-write failure must
+            // never become the return value of this call. See `cache_response`.
+            self.cache_response(&chat_request, &chat_response).await;
             result
         };
 
@@ -1366,6 +1401,50 @@ impl ChatClient {
         Ok(results)
     }
 
+    /// Persist a successful response to the disk cache (if a cache directory is
+    /// configured) and to the in-memory cache.
+    ///
+    /// **Best-effort by contract.** The API call has already succeeded and been
+    /// billed by the time this runs, so it must never return an error and never
+    /// panic on a cache failure: a read-only or permission-denied cache
+    /// directory would otherwise turn a paid, successful call into a returned
+    /// error. Failures are logged via `warn!` and swallowed; the caller still
+    /// receives its response.
+    async fn cache_response(&self, chat_request: &ChatRequest, chat_response: &str) {
+        if let Some(cache_directory) = &self.cache_directory {
+            let chat_request_cache_key = chat_request.cache_key();
+            match zstd::encode_all(chat_response.as_bytes(), 3) {
+                Ok(compressed) => {
+                    if let Err(e) = crate::utils::write_to_cache_dir(
+                        cache_directory,
+                        &chat_request_cache_key,
+                        &compressed,
+                    )
+                    .await
+                    {
+                        warn!(
+                            "tysm: failed to write response to cache dir {}: {e}. \
+                             The (billed) API response is still returned; only caching failed.",
+                            cache_directory.display()
+                        );
+                    }
+                }
+                Err(e) => warn!(
+                    "tysm: failed to zstd-compress response for the disk cache: {e}. \
+                     The (billed) API response is still returned; only caching failed."
+                ),
+            }
+        }
+
+        match serde_json::to_string(chat_request) {
+            Ok(key) => self.lru_insert(key, chat_response.to_string()),
+            Err(e) => warn!(
+                "tysm: failed to serialize request for the in-memory cache key: {e}. \
+                 The (billed) API response is still returned; only caching failed."
+            ),
+        }
+    }
+
     async fn chat_cached<T>(
         &self,
         chat_request: &ChatRequest,
@@ -1384,10 +1463,16 @@ impl ChatClient {
         // Then, check the cache directory (sharded, then flat)
         let cache_directory = self.cache_directory.as_ref()?;
         if !cache_directory.exists() {
-            panic!(
-                "Cache directory does not exist: {}",
+            // A missing (or not-yet-created) cache directory must degrade to a
+            // cache miss, never crash the caller. Returning `None` falls through
+            // to the real API call. We deliberately do NOT create the directory
+            // here; the write path (`cache_response`) creates it lazily on the
+            // first successful response.
+            debug!(
+                "tysm: cache directory {} does not exist; treating as a cache miss",
                 cache_directory.display()
             );
+            return None;
         }
 
         // Helper to search for a cache key across main and backup cache directories.
@@ -1511,6 +1596,114 @@ impl ChatClient {
     pub fn cost(&self) -> Option<f64> {
         let usage = self.usage();
         crate::model_prices::cost(&self.model, self.service_tier.as_deref(), usage)
+    }
+}
+
+/// Tests for the wfc maintenance fork's three cache-layer safety fixes.
+#[cfg(test)]
+mod wfc_cache_fixes {
+    use super::*;
+
+    /// A unique temp path that does not exist yet (for cache-dir tests).
+    fn unique_tmp_path(tag: &str) -> PathBuf {
+        let nonce = const_xxh3(
+            format!(
+                "{tag}-{:?}-{}",
+                std::time::SystemTime::now(),
+                std::process::id()
+            )
+            .as_bytes(),
+        );
+        std::env::temp_dir().join(format!("tysm-test-{tag}-{nonce:016x}"))
+    }
+
+    /// Defect 1: a missing cache directory must be a cache miss, not a panic.
+    /// Before the fix, `chat_cached` did `panic!("Cache directory does not exist")`.
+    #[tokio::test]
+    async fn missing_cache_dir_is_a_cache_miss_not_a_panic() {
+        let dir = unique_tmp_path("missing");
+        assert!(!dir.exists(), "precondition: cache dir must not exist");
+
+        let client = ChatClient::new("sk-test", "gpt-4o").with_cache_directory(&dir);
+
+        let request = ChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![ChatMessage::user("hello")],
+            response_format: ResponseFormat::Text,
+            service_tier: None,
+            reasoning_effort: None,
+            extra_body: None,
+        };
+
+        // Must return `None` (miss -> fall through to the real API), not panic.
+        let result = client
+            .chat_cached(&request, |s| Ok::<String, ChatError>(s))
+            .await;
+        assert!(
+            result.is_none(),
+            "a missing cache directory should be a miss"
+        );
+    }
+
+    /// Defect 2: a cache-WRITE failure on an already-billed call must be swallowed,
+    /// never propagated. We force `write_to_cache_dir` to fail regardless of the
+    /// running user by putting a regular file where a parent directory would need
+    /// to be, so `create_dir_all` fails with `NotADirectory` (works even as root).
+    #[tokio::test]
+    async fn cache_write_failure_is_swallowed() {
+        let blocker = unique_tmp_path("blocker");
+        std::fs::write(&blocker, b"i am a file, not a directory").unwrap();
+        // The cache dir sits *under* the regular file, so it can never be created.
+        let cache_dir = blocker.join("cache");
+        assert!(!cache_dir.exists());
+
+        let client = ChatClient::new("sk-test", "gpt-4o").with_cache_directory(&cache_dir);
+
+        let request = ChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![ChatMessage::user("hello")],
+            response_format: ResponseFormat::Text,
+            service_tier: None,
+            reasoning_effort: None,
+            extra_body: None,
+        };
+
+        // Must not panic and must not propagate an error even though the disk
+        // write fails (the API response was already paid for).
+        client.cache_response(&request, "the-billed-response").await;
+
+        // The in-memory cache still received the entry; only the disk write failed.
+        assert_eq!(client.lru.len(), 1);
+
+        std::fs::remove_file(&blocker).ok();
+    }
+
+    /// Defect 3: the in-memory `lru` map must stay bounded by `lru_capacity`.
+    /// Before the fix it grew without limit (a memory leak in long-lived clients).
+    #[test]
+    fn lru_stays_bounded_under_capacity() {
+        // Default capacity is applied by `new`.
+        assert_eq!(
+            ChatClient::new("sk-test", "gpt-4o").lru_capacity,
+            DEFAULT_LRU_CAPACITY
+        );
+
+        let cap = 8;
+        let client = ChatClient::new("sk-test", "gpt-4o").with_lru_capacity(cap);
+        for i in 0..1000 {
+            client.lru_insert(format!("key-{i}"), format!("value-{i}"));
+            assert!(
+                client.lru.len() <= cap,
+                "lru exceeded capacity after {i} inserts: {} > {cap}",
+                client.lru.len()
+            );
+        }
+        assert!(client.lru.len() <= cap);
+
+        // A capacity of 0 disables the in-memory cache entirely.
+        let client0 = ChatClient::new("sk-test", "gpt-4o").with_lru_capacity(0);
+        client0.lru_insert("k".to_string(), "v".to_string());
+        assert_eq!(client0.lru.len(), 0);
     }
 }
 

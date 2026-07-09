@@ -1,5 +1,32 @@
 # tysm - Thank You So Much
 
+> ## wfc maintenance fork
+>
+> This is `samirmirani/tysm`, a maintenance fork of [`not-pizza/tysm`](https://github.com/not-pizza/tysm)
+> based on the published **0.18.0** (branch `wfc`, version `0.18.1`). It exists to
+> fix three defects in the response-cache layer while preserving the 0.18.0 public
+> API and behavior:
+>
+> 1. **Missing cache directory no longer panics.** On the cache read path, a
+>    missing or not-yet-created cache directory now degrades to a cache miss
+>    (falls through to the API) instead of `panic!`-ing the caller. The directory
+>    is not auto-created on read; the write path creates it lazily.
+> 2. **Cache-write failures no longer fail an already-billed call.** On the write
+>    path, zstd-compression and disk-write errors are now best-effort: they are
+>    logged via `log::warn!` and swallowed, so a read-only or permission-denied
+>    cache directory can never turn a paid, successful API response into a
+>    returned `Err`.
+> 3. **The in-memory `lru` cache is now bounded.** The `lru` `DashMap` grew
+>    without limit (a memory leak in long-lived `static` clients). It now has a
+>    configurable capacity (`lru_capacity`, default 4096, set via
+>    `with_lru_capacity`) enforced by a generational reset: the map is cleared
+>    wholesale once it reaches capacity. The persistent on-disk cache is
+>    unaffected. (A generational bound is used because `DashMap` has no native
+>    LRU ordering; see the `lru_insert` doc comment for the tradeoff.)
+>
+> Each fix has unit tests in `src/chat_completions.rs`. Upstream metadata
+> (homepage/repository links below) is left pointing at `not-pizza/tysm`.
+
 **Batteries-included Rust OpenAI Client**
 
 Including...
