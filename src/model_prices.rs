@@ -239,25 +239,25 @@ pub(crate) const CHAT_COMPLETIONS: &[ModelCost] = &[
     ModelCost {
         name: "gemini-3.1-pro",
         input: 2.00,
-        cached_input: None,
+        cached_input: Some(0.20),
         output: 12.00,
     },
     ModelCost {
         name: "gemini-3-flash",
         input: 0.50,
-        cached_input: None,
+        cached_input: Some(0.05),
         output: 3.00,
     },
     ModelCost {
         name: "gemini-3.1-flash-lite",
         input: 0.25,
-        cached_input: None,
+        cached_input: Some(0.025),
         output: 1.50,
     },
     ModelCost {
         name: "gemini-3.5-flash",
         input: 1.50,
-        cached_input: None,
+        cached_input: Some(0.15),
         output: 9.00,
     },
     ModelCost {
@@ -291,6 +291,31 @@ pub(crate) const CHAT_COMPLETIONS: &[ModelCost] = &[
         output: 0.30,
     },
     // GPT-5 models
+    ModelCost {
+        // "gpt-5.6" alias routes to gpt-5.6-sol
+        name: "gpt-5.6",
+        input: 5.00,
+        cached_input: Some(0.50),
+        output: 30.00,
+    },
+    ModelCost {
+        name: "gpt-5.6-sol",
+        input: 5.00,
+        cached_input: Some(0.50),
+        output: 30.00,
+    },
+    ModelCost {
+        name: "gpt-5.6-terra",
+        input: 2.50,
+        cached_input: Some(0.25),
+        output: 15.00,
+    },
+    ModelCost {
+        name: "gpt-5.6-luna",
+        input: 1.00,
+        cached_input: Some(0.10),
+        output: 6.00,
+    },
     ModelCost {
         name: "gpt-5.5-pro",
         input: 30.00,
