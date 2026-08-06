@@ -724,6 +724,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "model-prices"
+version = "0.1.0"
+
+[[package]]
 name = "native-tls"
 version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1361,7 +1365,7 @@ dependencies = [
 
 [[package]]
 name = "tysm"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1370,10 +1374,12 @@ dependencies = [
  "itertools",
  "log",
  "lru",
+ "model-prices",
  "reqwest",
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-test",

@@ -502,13 +502,17 @@ impl BatchClient {
         }
     }
 
-    /// Wait for a batch to complete.
-    pub async fn wait_for_batch(&self, batch_id: &str) -> Result<Batch, WaitForBatchError> {
-        let mut attempts = 0;
+    /// Wait for a batch to complete, calling `on_progress` after every status poll.
+    pub async fn wait_for_batch(
+        &self,
+        batch_id: &str,
+        mut on_progress: impl FnMut(&Batch),
+    ) -> Result<Batch, WaitForBatchError> {
         let mut seconds_waited = 0;
 
         loop {
             let batch = self.get_batch_status(batch_id).await?;
+            on_progress(&batch);
 
             match batch.status {
                 BatchStatus::Completed => return Ok(batch),
@@ -525,14 +529,12 @@ impl BatchClient {
                     return Err(WaitForBatchError::BatchCancelled(batch_id.to_string()))
                 }
                 BatchStatus::InProgress | BatchStatus::Validating | BatchStatus::Finalizing => {
-                    attempts += 1;
                     // Still in progress, wait and try again
                     if seconds_waited >= 86400 {
                         return Err(WaitForBatchError::BatchTimeout(batch_id.to_string()));
                     }
 
-                    // Exponential backoff with a cap
-                    let delay = std::cmp::min(120, 2_u64.pow(attempts)) as u64;
+                    let delay = 5;
                     info!(
                         "batch {} is still in progress, waiting {} seconds",
                         batch_id, delay
